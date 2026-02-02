@@ -13,7 +13,7 @@ jobs:
 
     steps:
       _ name: checkout code
-        uses: action/checkout@v4
+        uses: actions/checkout@v4
 
 
       _ name: build placeholder
