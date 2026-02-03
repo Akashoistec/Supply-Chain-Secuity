@@ -1,25 +1,23 @@
 name: ci
 
+permissions:
+  contents: read
+  packages: write
 
 on:
   push:
     branches: ["main"]
   pull_request:
 
-
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-
-      - name: build placeholder
-        run: echo "ci is running"
-
-      - name: Run SAST (semgrep)
+      - name: Run SAST (Semgrep)
         uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
@@ -33,28 +31,29 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: 0
 
+      # ---------- IMAGE IDENTITY (SINGLE SOURCE OF TRUTH) ----------
       - name: Set image name
         id: image
         run: |
-          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE=ghcr.io/$OWNER/$REPO/demo-app
+          IMAGE=ghcr.io/${{ github.repository }}
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
-      - name: build container image
+      # ---------- BUILD ----------
+      - name: Build container image
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}/demo-app
-          docker build -t $IMAGE:ci .
+          docker build -t ${{ steps.image.outputs.image }}:ci .
 
+      # ---------- REGISTRY ----------
       - name: Login to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Push image
         run: |
-          IMAGE=ghcr.io/${{ github.repository }}/demo-app
-          docker push $IMAGE:ci
+          docker push ${{ steps.image.outputs.image }}:ci
 
+      # ---------- INSTALL TRIVY (HOST) ----------
       - name: Install Trivy
         run: |
           TRIVY_VERSION=0.52.2
@@ -63,47 +62,39 @@ jobs:
           sudo mv trivy /usr/local/bin/trivy
           trivy --version
 
+      # ---------- IMAGE SCAN (SIGNAL ONLY) ----------
       - name: Scan container image (Trivy CLI)
         run: |
-          trivy image demo-app:ci \
+          trivy image ${{ steps.image.outputs.image }}:ci \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
             --format table \
             --exit-code 0
 
-      - name: Generate SBOM (cycloneDX)
+      # ---------- SBOM ----------
+      - name: Generate SBOM (CycloneDX)
         run: |
-         trivy image demo-app:ci \
-         --format cyclonedx \
-         --output sbom.cdx.json
+          trivy image ${{ steps.image.outputs.image }}:ci \
+            --format cyclonedx \
+            --output sbom.cdx.json
 
-      - name: install Cosign
+      # ---------- RESOLVE DIGEST ----------
+      - name: Resolve image digest
+        id: digest
         run: |
-         curl -LO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
-         sudo install cosign-linux-amd64 /usr/local/bin/cosign
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.image.outputs.image }}:ci)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      # ---------- COSIGN ----------
+      - name: Install Cosign
+        run: |
+          curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          sudo install cosign-linux-amd64 /usr/local/bin/cosign
 
       - name: Generate Cosign key (demo only)
         run: |
           cosign generate-key-pair
 
-      - name: Sign image
+      - name: Sign image (by digest)
         run: |
-          cosign sign --key cosign.key demo-app:ci
-
-
-#      - name: Install Trivy
- #       run: |
-  #        docker build -t demo-app:ci .
-   #       sudo apt-get update 
-    #      sudo apt-get install -y wget
-     #     wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-      #    echo "deb https://aquasecurity.github.io/trivy-repo/deb stable main" | sudo tee /etc/apt/sources.list.d/trivy.list
-#
- #         sudo apt-get update
-  #        sudo apt-get install -y trivy
-   #   - name: Scan container image (trivy CLI)
-    #    run: |
-     #     trivy image demo-app:ci \
-      #    --severity CRITICAL,HIGH \
-       #   --ignore-unfixed \
-        #  --exit-code 0
+          cosign sign --key cosign.key ${{ steps.digest.outputs.digest }}
