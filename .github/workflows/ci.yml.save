@@ -2,7 +2,10 @@ name: ci
 
 permissions:
   contents: read
-  id-token: write
+  #packages: write
+  id-token: write # Required for OIDC
+
+
 
 on:
   push:
@@ -17,13 +20,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------------- SAST ----------------
       - name: Run SAST (Semgrep)
         uses: returntocorp/semgrep-action@v1
         with:
           config: p/ci
 
-      # ---------------- SCA ----------------
       - name: Run SCA (Trivy - filesystem scan)
         uses: aquasecurity/trivy-action@0.24.0
         with:
@@ -33,14 +34,15 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: 0
 
-      # ---------------- IMAGE IDENTITY ----------------
-      - name: Set ECR image name
+      #IMAGE IDENTITY (SINGLE SOURCE OF TRUTH)
+      - name: Set image name
         id: image
         run: |
-          IMAGE=910321623036.dkr.ecr.ap-south-1.amazonaws.com/demo-app
+          IMAGE=ghcr.io/${{ github.repository }}
+          IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
-      # ---------------- AWS OIDC ----------------
+      #---------OIDC ECR login and assumerole-------
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -50,59 +52,63 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ---------------- BUILD & PUSH ----------------
-      - name: Build image
+
+      # ---------- BUILD ----------
+      - name: Build container image
         run: |
           docker build -t demo-app:ci .
 
-      - name: Tag image
+      #----------Resistory-----------
+      - name: Tag image for ECR
         run: |
-          docker tag demo-app:ci ${{ steps.image.outputs.image }}:ci
+          docker tag demo-app:ci 910321623036.dkr.ecr.ap-south-1.amazonaws.com/demo-app:ci
 
-      - name: Push image
+      - name: Push image to ECR
         run: |
-          docker push ${{ steps.image.outputs.image }}:ci
+          docker push 910321623036.dkr.ecr.ap-south-1.amazonaws.com/demo-app:ci
 
-      # ---------------- INSTALL TRIVY ----------------
+      # ---------- INSTALL TRIVY (HOST) ----------
       - name: Install Trivy
         run: |
           TRIVY_VERSION=0.52.2
           curl -sfL https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -o trivy.tar.gz
           tar -xzf trivy.tar.gz
           sudo mv trivy /usr/local/bin/trivy
+          trivy --version
 
-      # ---------------- IMAGE SCAN ----------------
-      - name: Scan image (signal only)
+      # ---------- IMAGE SCAN (SIGNAL ONLY) ----------
+      - name: Scan container image (Trivy CLI)
         run: |
           trivy image ${{ steps.image.outputs.image }}:ci \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
+            --format table \
             --exit-code 0
 
-      # ---------------- SBOM ----------------
-      - name: Generate SBOM
+      # ---------- SBOM ----------
+      - name: Generate SBOM (CycloneDX)
         run: |
           trivy image ${{ steps.image.outputs.image }}:ci \
             --format cyclonedx \
             --output sbom.cdx.json
 
-      # ---------------- DIGEST ----------------
+      # ---------- RESOLVE DIGEST ----------
       - name: Resolve image digest
         id: digest
         run: |
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ steps.image.outputs.image }}:ci)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
-      # ---------------- COSIGN ----------------
+      # ---------- COSIGN ----------
       - name: Install Cosign
         run: |
           curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
           sudo install cosign-linux-amd64 /usr/local/bin/cosign
 
-      - name: Generate Cosign key (demo)
+      - name: Generate Cosign key (demo only)
         run: |
           cosign generate-key-pair
 
-      - name: Sign image
+      - name: Sign image (by digest)
         run: |
           cosign sign --key cosign.key ${{ steps.digest.outputs.digest }}
